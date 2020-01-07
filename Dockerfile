@@ -4,8 +4,8 @@ RUN apt-get update && apt-get install libcgmanager-dev libnih-dbus-dev libnih-de
 
 ENV LXCFS_VERSION 3.1.2
 RUN wget https://linuxcontainers.org/downloads/lxcfs/lxcfs-$LXCFS_VERSION.tar.gz && \
-	mkdir /lxcfs && tar xzvf lxcfs-$LXCFS_VERSION.tar.gz -C /lxcfs  --strip-components=1 && \
-	cd /lxcfs && ./configure && make
+	tar xf lxcfs-$LXCFS_VERSION.tar.gz && \
+	cd /lxcfs-$LXCFS_VERSION && sh ./configure && make -j
 
 FROM alpine:3.10
 
