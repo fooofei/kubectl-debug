@@ -19,7 +19,8 @@ before_deploy:
 deploy:
   - provider: script
     script: bash ./scripts/docker_push.sh
-
+    on:
+      branch: aarch64
 arch:
   - arm64
 os: linux 
