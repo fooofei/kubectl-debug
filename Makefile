@@ -1,7 +1,7 @@
 .PHONY: build plugin agent check
 
-LDFLAGS = $(shell sh ./version.sh)
-GOENV  := GO15VENDOREXPERIMENT="1" GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=arm64
+LDFLAGS = $(shell ./version.sh)
+GOENV  := GO15VENDOREXPERIMENT="1" GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 GO := $(GOENV) go
 
 default: build
