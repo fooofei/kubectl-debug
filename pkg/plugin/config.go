@@ -6,35 +6,38 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-type RegistryAuthConfig struct {
-	Username string `yaml:"username,omitempty"`
-	Password string `yaml:"password,omitempty"`
-}
 type Config struct {
-	AgentPort               int      `yaml:"agentPort,omitempty"`
-	Image                   string   `yaml:"image,omitempty"`
-	RegistrySecretName      string   `yaml:"registrySecretName,omitempty"`
-	RegistrySecretNamespace string   `yaml:"registrySecretNamespace,omitempty"`
-	ForkPodRetainLabels     []string `yaml:"forkPodRetainLabels,omitempty"`
-	DebugAgentDaemonSet     string   `yaml:"debugAgentDaemonset,omitempty"`
-	DebugAgentNamespace     string   `yaml:"debugAgentNamespace,omitempty"`
-	Command                 []string `yaml:"command,omitempty"`
-	PortForward             bool     `yaml:"portForward,omitempty"`
-	Agentless               bool     `yaml:"agentless,omitempty"`
-	AgentPodNamePrefix      string   `yaml:"agentPodNamePrefix,omitempty"`
-	AgentPodNamespace       string   `yaml:"agentPodNamespace,omitempty"`
-	AgentImage              string   `yaml:"agentImage,omitempty"`
-	AgentPodCpuRequests     string   `yaml:"agentCpuRequests,omitempty"`
-	AgentPodMemoryRequests  string   `yaml:"agentMemoryRequests,omitempty"`
-	AgentPodCpuLimits       string   `yaml:"agentCpuLimits,omitempty"`
-	AgentPodMemoryLimits    string   `yaml:"agentMemoryLimits,omitempty"`
-	IsLxcfsEnabled          bool     `yaml:"isLxcfsEnabled,omitempty"`
+	AgentPort                int      `yaml:"agentPort,omitempty"`
+	Image                    string   `yaml:"image,omitempty"`
+	RegistrySecretName       string   `yaml:"registrySecretName,omitempty"`
+	RegistrySecretNamespace  string   `yaml:"registrySecretNamespace,omitempty"`
+	RegistrySkipTLSVerify    bool     `yaml:"registrySkipTLSVerify,omitempty"`
+	ForkPodRetainLabels      []string `yaml:"forkPodRetainLabels,omitempty"`
+	DebugAgentDaemonSet      string   `yaml:"debugAgentDaemonset,omitempty"`
+	DebugAgentNamespace      string   `yaml:"debugAgentNamespace,omitempty"`
+	Command                  []string `yaml:"command,omitempty"`
+	PortForward              bool     `yaml:"portForward,omitempty"`
+	Agentless                bool     `yaml:"agentless,omitempty"`
+	AgentPodNamePrefix       string   `yaml:"agentPodNamePrefix,omitempty"`
+	AgentPodNamespace        string   `yaml:"agentPodNamespace,omitempty"`
+	AgentImage               string   `yaml:"agentImage,omitempty"`
+	AgentImagePullPolicy     string   `yaml:"agentImagePullPolicy,omitempty"`
+	AgentImagePullSecretName string   `yaml:"agentImagePullSecretName,omitempty"`
+	AgentPodCpuRequests      string   `yaml:"agentCpuRequests,omitempty"`
+	AgentPodMemoryRequests   string   `yaml:"agentMemoryRequests,omitempty"`
+	AgentPodCpuLimits        string   `yaml:"agentCpuLimits,omitempty"`
+	AgentPodMemoryLimits     string   `yaml:"agentMemoryLimits,omitempty"`
+	IsLxcfsEnabled           bool     `yaml:"isLxcfsEnabled,omitempty"`
+	Verbosity                int      `yaml:"verbosity,omitempty"`
 	// deprecated
 	AgentPortOld int `yaml:"agent_port,omitempty"`
 }
 
 func Load(s string) (*Config, error) {
 	cfg := &Config{}
+	cfg.Agentless = true
+	cfg.PortForward = true
+	cfg.IsLxcfsEnabled = true
 	err := yaml.Unmarshal([]byte(s), cfg)
 	if err != nil {
 		return nil, err

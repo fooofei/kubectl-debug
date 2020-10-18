@@ -2,13 +2,16 @@ package plugin
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -30,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
+	cmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/tools/watch"
@@ -64,7 +68,7 @@ Run a container in a running pod, this container will join the namespaces of an 
 
 You may set default configuration such as image and command in the config file, which locates in "~/.kube/debug-config" by default.
 `
-	defaultImage          = "nicolaka/netshoot:latest"
+	defaultImage          = "docker.io/nicolaka/netshoot:latest"
 	defaultAgentPort      = 10027
 	defaultConfigLocation = "/.kube/debug-config"
 	defaultDaemonSetName  = "debug-agent"
@@ -72,20 +76,28 @@ You may set default configuration such as image and command in the config file, 
 
 	usageError = "expects 'debug POD_NAME' for debug command"
 
-	defaultAgentImage             = "aylei/debug-agent:latest"
-	defaultAgentPodNamePrefix     = "debug-agent-pod"
-	defaultAgentPodNamespace      = "default"
-	defaultAgentPodCpuRequests    = ""
-	defaultAgentPodCpuLimits      = ""
-	defaultAgentPodMemoryRequests = ""
-	defaultAgentPodMemoryLimits   = ""
+	defaultAgentImage               = "aylei/debug-agent:latest"
+	defaultAgentImagePullPolicy     = string(corev1.PullIfNotPresent)
+	defaultAgentImagePullSecretName = ""
+	defaultAgentPodNamePrefix       = "debug-agent-pod"
+	defaultAgentPodNamespace        = "default"
+	defaultAgentPodCpuRequests      = ""
+	defaultAgentPodCpuLimits        = ""
+	defaultAgentPodMemoryRequests   = ""
+	defaultAgentPodMemoryLimits     = ""
 
 	defaultRegistrySecretName      = "kubectl-debug-registry-secret"
 	defaultRegistrySecretNamespace = "default"
+	defaultRegistrySkipTLSVerify   = false
 
 	defaultPortForward = true
 	defaultAgentless   = true
 	defaultLxcfsEnable = true
+	defaultVerbosity   = 0
+
+	enableLxcsFlag  = "enable-lxcfs"
+	portForwardFlag = "port-forward"
+	agentlessFlag   = "agentless"
 )
 
 // DebugOptions specify how to run debug container in a running pod
@@ -99,6 +111,7 @@ type DebugOptions struct {
 	Image                   string
 	RegistrySecretName      string
 	RegistrySecretNamespace string
+	RegistrySkipTLSVerify   bool
 
 	ContainerName       string
 	Command             []string
@@ -108,8 +121,10 @@ type DebugOptions struct {
 	Fork                bool
 	ForkPodRetainLabels []string
 	//used for agentless mode
-	AgentLess  bool
-	AgentImage string
+	AgentLess                bool
+	AgentImage               string
+	AgentImagePullPolicy     string
+	AgentImagePullSecretName string
 	// agentPodName = agentPodNamePrefix + nodeName
 	AgentPodName      string
 	AgentPodNamespace string
@@ -138,6 +153,10 @@ type DebugOptions struct {
 	genericclioptions.IOStreams
 
 	wait sync.WaitGroup
+
+	Verbosity int
+	Logger    *log.Logger
+	UserName  string
 }
 
 type agentPodResources struct {
@@ -155,6 +174,7 @@ func NewDebugOptions(streams genericclioptions.IOStreams) *DebugOptions {
 		PortForwarder: &defaultPortForwarder{
 			IOStreams: streams,
 		},
+		Logger: log.New(streams.Out, "kubectl-debug ", (log.LstdFlags | log.Lshortfile)),
 	}
 }
 
@@ -184,6 +204,8 @@ func NewDebugCmd(streams genericclioptions.IOStreams) *cobra.Command {
 		"private registry secret name, default is kubectl-debug-registry-secret")
 	cmd.Flags().StringVar(&opts.RegistrySecretNamespace, "registry-secret-namespace", "",
 		"private registry secret namespace, default is default")
+	cmd.Flags().BoolVar(&opts.RegistrySkipTLSVerify, "registry-skip-tls-verify", false,
+		"If true, the registry's certificate will not be checked for validity. This will make your HTTPS connections insecure")
 	cmd.Flags().StringSliceVar(&opts.ForkPodRetainLabels, "fork-pod-retain-labels", []string{},
 		"in fork mode the pod labels retain labels name list, default is not set")
 	cmd.Flags().StringVarP(&opts.ContainerName, "container", "c", "",
@@ -191,20 +213,24 @@ func NewDebugCmd(streams genericclioptions.IOStreams) *cobra.Command {
 	cmd.Flags().IntVarP(&opts.AgentPort, "port", "p", 0,
 		fmt.Sprintf("Agent port for debug cli to connect, default to %d", defaultAgentPort))
 	cmd.Flags().StringVar(&opts.ConfigLocation, "debug-config", "",
-		fmt.Sprintf("Debug config file, default to ~%s", defaultConfigLocation))
+		fmt.Sprintf("Debug config file, default to ~%s", filepath.FromSlash(defaultConfigLocation)))
 	cmd.Flags().BoolVar(&opts.Fork, "fork", false,
 		"Fork a new pod for debugging (useful if the pod status is CrashLoopBackoff)")
-	cmd.Flags().BoolVar(&opts.PortForward, "port-forward", true,
+	cmd.Flags().BoolVar(&opts.PortForward, portForwardFlag, true,
 		fmt.Sprintf("Whether using port-forward to connect debug-agent, default to %t", defaultPortForward))
 	cmd.Flags().StringVar(&opts.DebugAgentDaemonSet, "daemonset-name", opts.DebugAgentDaemonSet,
 		"Debug agent daemonset name when using port-forward")
 	cmd.Flags().StringVar(&opts.DebugAgentNamespace, "daemonset-ns", opts.DebugAgentNamespace,
 		"Debug agent namespace, default to 'default'")
 	// flags used for agentless mode.
-	cmd.Flags().BoolVarP(&opts.AgentLess, "agentless", "a", true,
+	cmd.Flags().BoolVarP(&opts.AgentLess, agentlessFlag, "a", true,
 		fmt.Sprintf("Whether to turn on agentless mode. Agentless mode: debug target pod if there isn't an agent running on the target host, default to %t", defaultAgentless))
 	cmd.Flags().StringVar(&opts.AgentImage, "agent-image", "",
 		fmt.Sprintf("Agentless mode, the container Image to run the agent container , default to %s", defaultAgentImage))
+	cmd.Flags().StringVar(&opts.AgentImagePullPolicy, "agent-pull-policy", "",
+		fmt.Sprintf("Agentless mode, the container Image pull policy , default to %s", defaultAgentImagePullPolicy))
+	cmd.Flags().StringVar(&opts.AgentImagePullSecretName, "agent-pull-secret-name", "",
+		fmt.Sprintf("Agentless mode, the container Image pull secret name , default to empty"))
 	cmd.Flags().StringVar(&opts.AgentPodName, "agent-pod-name-prefix", "",
 		fmt.Sprintf("Agentless mode, pod name prefix , default to %s", defaultAgentPodNamePrefix))
 	cmd.Flags().StringVar(&opts.AgentPodNamespace, "agent-pod-namespace", "",
@@ -217,8 +243,10 @@ func NewDebugCmd(streams genericclioptions.IOStreams) *cobra.Command {
 		fmt.Sprintf("Agentless mode, agent pod cpu limits, default is not set"))
 	cmd.Flags().StringVar(&opts.AgentPodResource.MemoryLimits, "agent-pod-memory-limits", "",
 		fmt.Sprintf("Agentless mode, agent pod memory limits, default is not set"))
-	cmd.Flags().BoolVarP(&opts.IsLxcfsEnabled, "enable-lxcfs", "", true,
+	cmd.Flags().BoolVarP(&opts.IsLxcfsEnabled, enableLxcsFlag, "", true,
 		fmt.Sprintf("Enable Lxcfs, the target container can use its proc files, default to %t", defaultLxcfsEnable))
+	cmd.Flags().IntVarP(&opts.Verbosity, "verbosity ", "v", 0,
+		fmt.Sprintf("Set logging verbosity, default to %d", defaultVerbosity))
 	opts.Flags.AddFlags(cmd.Flags())
 
 	return cmd
@@ -252,7 +280,7 @@ func (o *DebugOptions) Complete(cmd *cobra.Command, args []string, argsLenAtDash
 	if len(o.ConfigLocation) < 1 {
 		usr, err := user.Current()
 		if err == nil {
-			configFile = usr.HomeDir + defaultConfigLocation
+			configFile = usr.HomeDir + filepath.FromSlash(defaultConfigLocation)
 		}
 	}
 	config, err := LoadFile(configFile)
@@ -294,6 +322,13 @@ func (o *DebugOptions) Complete(cmd *cobra.Command, args []string, argsLenAtDash
 			o.RegistrySecretNamespace = defaultRegistrySecretNamespace
 		}
 	}
+	if !o.RegistrySkipTLSVerify {
+		if config.RegistrySkipTLSVerify {
+			o.RegistrySkipTLSVerify = config.RegistrySkipTLSVerify
+		} else {
+			o.RegistrySkipTLSVerify = defaultRegistrySkipTLSVerify
+		}
+	}
 	if len(o.ForkPodRetainLabels) < 1 {
 		if len(config.ForkPodRetainLabels) > 0 {
 			o.ForkPodRetainLabels = config.ForkPodRetainLabels
@@ -306,6 +341,15 @@ func (o *DebugOptions) Complete(cmd *cobra.Command, args []string, argsLenAtDash
 			o.AgentPort = defaultAgentPort
 		}
 	}
+
+	if o.Verbosity < 1 {
+		if config.Verbosity > 0 {
+			o.Verbosity = config.Verbosity
+		} else {
+			o.Verbosity = defaultVerbosity
+		}
+	}
+
 	if len(o.DebugAgentNamespace) < 1 {
 		if len(config.DebugAgentNamespace) > 0 {
 			o.DebugAgentNamespace = config.DebugAgentNamespace
@@ -334,6 +378,22 @@ func (o *DebugOptions) Complete(cmd *cobra.Command, args []string, argsLenAtDash
 			o.AgentImage = config.AgentImage
 		} else {
 			o.AgentImage = defaultAgentImage
+		}
+	}
+
+	if len(o.AgentImagePullPolicy) < 1 {
+		if len(config.AgentImagePullPolicy) > 0 {
+			o.AgentImagePullPolicy = config.AgentImagePullPolicy
+		} else {
+			o.AgentImagePullPolicy = defaultAgentImagePullPolicy
+		}
+	}
+
+	if len(o.AgentImagePullSecretName) < 1 {
+		if len(config.AgentImagePullSecretName) > 0 {
+			o.AgentImagePullSecretName = config.AgentImagePullSecretName
+		} else {
+			o.AgentImagePullSecretName = defaultAgentImagePullSecretName
 		}
 	}
 
@@ -377,17 +437,16 @@ func (o *DebugOptions) Complete(cmd *cobra.Command, args []string, argsLenAtDash
 		}
 	}
 
-	if o.IsLxcfsEnabled {
+	if !cmd.Flag(enableLxcsFlag).Changed {
 		o.IsLxcfsEnabled = config.IsLxcfsEnabled
-	} else {
-		o.IsLxcfsEnabled = defaultLxcfsEnable
 	}
 
-	if config.PortForward {
-		o.PortForward = true
+	if !cmd.Flag(portForwardFlag).Changed {
+		o.PortForward = config.PortForward
 	}
-	if config.Agentless {
-		o.AgentLess = true
+
+	if !cmd.Flag(agentlessFlag).Changed {
+		o.AgentLess = config.Agentless
 	}
 
 	o.Ports = []string{strconv.Itoa(o.AgentPort)}
@@ -395,6 +454,37 @@ func (o *DebugOptions) Complete(cmd *cobra.Command, args []string, argsLenAtDash
 	if err != nil {
 		return err
 	}
+
+	o.UserName = "unidentified user"
+	// cli help for the flags referenced below can be viewed by running
+	// kubectl options
+	if o.Flags.Username != nil && len(*o.Flags.Username) > 0 {
+		// --username : "Username for basic authentication to the API server"
+		o.UserName = *o.Flags.Username
+		log.Printf("User name '%v' received from switch --username\r\n", o.UserName)
+	} else if o.Flags.AuthInfoName != nil && len(*o.Flags.AuthInfoName) > 0 {
+		// --user : "The name of the kubeconfig user to use"
+		o.UserName = *o.Flags.AuthInfoName
+		log.Printf("User name '%v' received from switch --user\r\n", o.UserName)
+	} else {
+		rwCfg, err := configLoader.RawConfig()
+		if err != nil {
+			log.Printf("Failed to load configuration : %v\r\n", err)
+			return err
+		}
+		var cfgCtxt *cmdapi.Context
+		if o.Flags.Context != nil && len(*o.Flags.Context) > 0 {
+			// --context : "The name of the kubeconfig context to use"
+			cfgCtxt = rwCfg.Contexts[*o.Flags.Context]
+			log.Printf("Getting user name from context '%v' received from switch --context\r\n", *o.Flags.Context)
+		} else {
+			cfgCtxt = rwCfg.Contexts[rwCfg.CurrentContext]
+			log.Printf("Getting user name from default context '%v'\r\n", rwCfg.CurrentContext)
+		}
+		o.UserName = cfgCtxt.AuthInfo
+		log.Printf("User name '%v' received from context\r\n", o.UserName)
+	}
+
 	clientset, err := kubernetes.NewForConfig(o.Config)
 	if err != nil {
 		return err
@@ -491,6 +581,9 @@ func (o *DebugOptions) Run() error {
 		var agent *corev1.Pod
 		if !o.AgentLess {
 			// Agent is running
+			if o.Verbosity > 0 {
+				o.Logger.Printf("Fetching daemonset '%v' from namespace %v\r\n", o.DebugAgentDaemonSet, o.DebugAgentNamespace)
+			}
 			daemonSet, err := o.KubeCli.AppsV1().DaemonSets(o.DebugAgentNamespace).Get(o.DebugAgentDaemonSet, v1.GetOptions{})
 			if err != nil {
 				return err
@@ -513,9 +606,11 @@ func (o *DebugOptions) Run() error {
 		}
 
 		if agent == nil {
-			return fmt.Errorf("there is no agent pod in the same node with your speficy pod %s", o.PodName)
+			return fmt.Errorf("there is no agent pod in the same node with your specified pod %s", o.PodName)
 		}
-		fmt.Fprintf(o.Out, "pod %s PodIP %s, agentPodIP %s\n", o.PodName, pod.Status.PodIP, agent.Status.HostIP)
+		if o.Verbosity > 0 {
+			fmt.Fprintf(o.Out, "pod %s PodIP %s, agentPodIP %s\n", o.PodName, pod.Status.PodIP, agent.Status.HostIP)
+		}
 		err = o.runPortForward(agent)
 		if err != nil {
 			o.deleteAgent(agentPod)
@@ -525,7 +620,9 @@ func (o *DebugOptions) Run() error {
 		// than we use forward ports to connect the specified pod and that will listen
 		// on specified ports in localhost, the ports can not access until receive the
 		// ready signal
-		fmt.Fprintln(o.Out, "wait for forward port to debug agent ready...")
+		if o.Verbosity > 0 {
+			fmt.Fprintln(o.Out, "wait for forward port to debug agent ready...")
+		}
 		<-o.ReadyChannel
 	}
 
@@ -545,21 +642,36 @@ func (o *DebugOptions) Run() error {
 		params := url.Values{}
 		params.Add("image", o.Image)
 		params.Add("container", containerID)
+		params.Add("verbosity", fmt.Sprintf("%v", o.Verbosity))
+		hstNm, _ := os.Hostname()
+		params.Add("hostname", hstNm)
+		params.Add("username", o.UserName)
 		if o.IsLxcfsEnabled {
 			params.Add("lxcfsEnabled", "true")
 		} else {
 			params.Add("lxcfsEnabled", "false")
 		}
+		if o.RegistrySkipTLSVerify {
+			params.Add("registrySkipTLS", "true")
+		} else {
+			params.Add("registrySkipTLS", "false")
+		}
 		var authStr string
 		registrySecret, err := o.CoreClient.Secrets(o.RegistrySecretNamespace).Get(o.RegistrySecretName, v1.GetOptions{})
 		if err != nil {
 			if errors.IsNotFound(err) {
+				if o.Verbosity > 0 {
+					o.Logger.Printf("Secret %v not found in namespace %v\r\n", o.RegistrySecretName, o.RegistrySecretNamespace)
+				}
 				authStr = ""
 			} else {
 				return err
 			}
 		} else {
-			authStr = string(registrySecret.Data["authStr"])
+			if o.Verbosity > 1 {
+				o.Logger.Printf("Found secret %v:%v\r\n", o.RegistrySecretNamespace, o.RegistrySecretName)
+			}
+			authStr, _ = o.extractSecret(registrySecret.Data)
 		}
 		params.Add("authStr", authStr)
 		commandBytes, err := json.Marshal(o.Command)
@@ -605,6 +717,47 @@ func (o *DebugOptions) Run() error {
 	return nil
 }
 
+func (o *DebugOptions) extractSecret(scrtDta map[string][]byte) (string, error) {
+	var ret []byte
+	ret = scrtDta["authStr"]
+	if len(ret) == 0 {
+		// In IKS ( IBM Kubernetes ) the secret is stored in a json blob with the key '.dockerconfigjson'
+		// The json has the form
+		// {"auths":{"<REGISTRY FOR REGION>":{"username":"iamapikey","password":"<APIKEY>","email":"iamapikey","auth":"<APIKEY>"}}}
+		// Where <REGISTRY FOR REGION> would be one of the public domain names values here
+		// https://cloud.ibm.com/docs/Registry?topic=registry-registry_overview#registry_regions_local
+		// e.g. us.icr.io
+		ret = scrtDta[".dockerconfigjson"]
+		if len(ret) == 0 {
+			return "", nil
+		} else if o.Verbosity > 0 {
+			o.Logger.Printf("Found secret with key .dockerconfigjson\r\n")
+		}
+
+		var dta map[string]interface{}
+		if err := json.Unmarshal(ret, &dta); err != nil {
+			o.Logger.Printf("Failed to parse .dockerconfigjson value: %v\r\n", err)
+			return "", err
+		} else {
+			dta = dta["auths"].(map[string]interface{})
+			// Under auths there will be a value stored with the region key.  e.g. "us.icr.io"
+			for _, v := range dta {
+				dta = v.(map[string]interface{})
+				break
+			}
+			sret := dta["auth"].(string)
+			ret, err = base64.StdEncoding.DecodeString(sret)
+			if err != nil {
+				o.Logger.Printf("Failed to base 64 decode auth value : %v\r\n", err)
+				return "", err
+			}
+		}
+	} else if o.Verbosity > 0 {
+		o.Logger.Println("Found secret with key authStr")
+	}
+	return string(ret), nil
+}
+
 func (o *DebugOptions) getContainerIDByName(pod *corev1.Pod, containerName string) (string, error) {
 	for _, containerStatus := range pod.Status.ContainerStatuses {
 		if containerStatus.Name != containerName {
@@ -613,6 +766,9 @@ func (o *DebugOptions) getContainerIDByName(pod *corev1.Pod, containerName strin
 		// #52 if a pod is running but not ready(because of readiness probe), we can connect
 		if containerStatus.State.Running == nil {
 			return "", fmt.Errorf("container [%s] not running", containerName)
+		}
+		if o.Verbosity > 0 {
+			o.Logger.Printf("Getting id from containerStatus %+v\r\n", containerStatus)
 		}
 		return containerStatus.ContainerID, nil
 	}
@@ -624,6 +780,9 @@ func (o *DebugOptions) getContainerIDByName(pod *corev1.Pod, containerName strin
 		}
 		if initContainerStatus.State.Running == nil {
 			return "", fmt.Errorf("init container [%s] is not running", containerName)
+		}
+		if o.Verbosity > 0 {
+			o.Logger.Printf("Getting id from initContainerStatus %+v\r\n", initContainerStatus)
 		}
 		return initContainerStatus.ContainerID, nil
 	}
@@ -640,9 +799,16 @@ func (o *DebugOptions) remoteExecute(
 	tty bool,
 	terminalSizeQueue remotecommand.TerminalSizeQueue) error {
 
+	if o.Verbosity > 0 {
+		o.Logger.Printf("Creating SPDY executor %+v %+v %+v\r\n", config, method, url)
+	}
 	exec, err := remotecommand.NewSPDYExecutor(config, method, url)
 	if err != nil {
+		o.Logger.Printf("Error creating SPDY executor.\r\n")
 		return err
+	}
+	if o.Verbosity > 0 {
+		o.Logger.Printf("Creating exec Stream\r\n")
 	}
 	return exec.Stream(remotecommand.StreamOptions{
 		Stdin:             stdin,
@@ -756,11 +922,16 @@ func (o *DebugOptions) getAgentPod() *corev1.Pod {
 		Spec: corev1.PodSpec{
 			HostPID:  true,
 			NodeName: o.AgentPodNode,
+			ImagePullSecrets: []corev1.LocalObjectReference{
+				{
+					Name: o.AgentImagePullSecretName,
+				},
+			},
 			Containers: []corev1.Container{
 				{
 					Name:            "debug-agent",
 					Image:           o.AgentImage,
-					ImagePullPolicy: corev1.PullAlways,
+					ImagePullPolicy: corev1.PullPolicy(o.AgentImagePullPolicy),
 					LivenessProbe: &corev1.Probe{
 						Handler: corev1.Handler{
 							HTTPGet: &corev1.HTTPGetAction{
@@ -787,9 +958,22 @@ func (o *DebugOptions) getAgentPod() *corev1.Pod {
 							Name:      "cgroup",
 							MountPath: "/sys/fs/cgroup",
 						},
+						// containerd client will need to access /var/data, /run/containerd and /run/runc
+						{
+							Name:      "vardata",
+							MountPath: "/var/data",
+						},
+						{
+							Name:      "runcontainerd",
+							MountPath: "/run/containerd",
+						},
+						{
+							Name:      "runrunc",
+							MountPath: "/run/runc",
+						},
 						{
 							Name:             "lxcfs",
-							MountPath:        "/var/lib/lxc/lxcfs",
+							MountPath:        "/var/lib/lxc",
 							MountPropagation: &prop,
 						},
 					},
@@ -823,8 +1007,32 @@ func (o *DebugOptions) getAgentPod() *corev1.Pod {
 					Name: "lxcfs",
 					VolumeSource: corev1.VolumeSource{
 						HostPath: &corev1.HostPathVolumeSource{
-							Path: "/var/lib/lxc/lxcfs",
+							Path: "/var/lib/lxc",
 							Type: &directoryCreate,
+						},
+					},
+				},
+				{
+					Name: "vardata",
+					VolumeSource: corev1.VolumeSource{
+						HostPath: &corev1.HostPathVolumeSource{
+							Path: "/var/data",
+						},
+					},
+				},
+				{
+					Name: "runcontainerd",
+					VolumeSource: corev1.VolumeSource{
+						HostPath: &corev1.HostPathVolumeSource{
+							Path: "/run/containerd",
+						},
+					},
+				},
+				{
+					Name: "runrunc",
+					VolumeSource: corev1.VolumeSource{
+						HostPath: &corev1.HostPathVolumeSource{
+							Path: "/run/runc",
 						},
 					},
 				},
@@ -848,8 +1056,15 @@ func (o *DebugOptions) runPortForward(pod *corev1.Pod) error {
 			Namespace(pod.Namespace).
 			Name(pod.Name).
 			SubResource("portforward")
-		o.PortForwarder.ForwardPorts("POST", req.URL(), o)
-		fmt.Fprintln(o.Out, "end port-forward...")
+		err := o.PortForwarder.ForwardPorts("POST", req.URL(), o)
+		if err != nil {
+			log.Printf("PortForwarded failed with %+v\r\n", err)
+			log.Printf("Sending ready signal just in case the failure reason is that the port is already forwarded.\r\n")
+			o.ReadyChannel <- struct{}{}
+		}
+		if o.Verbosity > 0 {
+			fmt.Fprintln(o.Out, "end port-forward...")
+		}
 	}()
 	return nil
 }
