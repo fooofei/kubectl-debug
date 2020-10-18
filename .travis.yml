@@ -3,9 +3,9 @@ services:
   - docker
 language: go
 go:
-  - "1.12.x"
+  - "1.15.x"
 env:
-  - GO111MODULE=on make build
+  - make build
 
 install:
   - go mod download
