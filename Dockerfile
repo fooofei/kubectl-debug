@@ -6,6 +6,7 @@ FROM alpine:3.11.5
 
 COPY --from=build /usr/bin/lxcfs /usr/bin/lxcfs
 COPY --from=build /usr/lib/*fuse* /usr/lib/
+COPY --from=build /usr/lib/lxcfs /usr/lib/lxcfs
 COPY --from=build /usr/bin/ctr /usr/bin/ctr
 
 COPY ./scripts/start.sh /
